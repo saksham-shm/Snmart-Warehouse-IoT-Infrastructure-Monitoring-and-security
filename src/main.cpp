@@ -1,37 +1,39 @@
+#include <DHT22.h>
+
+#include <LiquidCrystal_I2C.h>
 #include<Wire.h>
-#include<LiquidCrystal_I2C.h>
 #include<SPI.h>
 #include<MFRC522.h>
 #include<ESP32Servo.h>
-#include<DHT.h>
+// #include<DHT.h>
 
 
-LiquidCrystal_I2C lcd(0x27,16,2);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
 
 // RFID pins
 #define ssPin 5
 #define rstPin 4
-#define dhtOne 16
-#define dhtTwo 17
-#define dhtType DHT22
+#define dhtOne 33
+#define dhtTwo 25
 #define pirPIN 32
 
 
 MFRC522 rfid(ssPin,rstPin);
-DHT dht1(dhtOne,dhtType);
-DHT dht2(dhtTwo,dhtType);
+DHT22 dht1(dhtOne);   
+DHT22 dht2(dhtTwo);
 
 // Relay Pins, Buzzer pins, ServoPins
-const int relay1=25;
-const int relay2=26;
-const int buzzer=2;
+const int relay1 = 27;   
+const int relay2 = 14;
+const int buzzer=12;
 const int servopin=13;
 const int gasPin=34;
-const int gasThreshold1=500;
-const int gasThreshold2=1200;
+const int gasThreshold1=400;
+const int gasThreshold2=800;
 Servo servo1;
 
-String cardsAccepted[] = {"01 02 03 04","11 22 33 44","55 66 77 88"};
+//  08 2F BF 33
+String cardsAccepted[] = {"83 AC CD 27","01 AC 03 04","55 66 77 88"};
 String employeeName[] = {"Employee 1","Employee 2","Employee 3"};
 
 unsigned long lastSensorRead = 0;
@@ -40,7 +42,7 @@ const unsigned long sensorInterval = 2000;
 
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(9600);
   SPI.begin();
   rfid.PCD_Init();
     // SDA = Serial Data -> 23 SCL = Serial Clock ->22
@@ -48,9 +50,16 @@ void setup() {
   Wire.begin(21,22);  // LCD Screen 1    
   lcd.init();
   lcd.backlight();
+
+  lcd.setCursor(0,0);
+  lcd.print("hello");
+  lcd.setCursor(0,1);
+  lcd.print("Begin");
   // Relay
   pinMode(relay1, OUTPUT);
   pinMode(relay2,OUTPUT);
+  digitalWrite(relay1, LOW);   // ← add this
+  digitalWrite(relay2, LOW);  
   // digitalWrite(relay1,LOW);
   // Buzzer
   pinMode(buzzer,OUTPUT);
@@ -59,9 +68,6 @@ void setup() {
   servo1.attach(servopin);
   servo1.write(0);
 
-  dht1.begin();
-  dht2.begin();
-  
   pinMode(gasPin, INPUT);
   Serial.println("MFRC522 Ready");
 
@@ -91,7 +97,7 @@ void buzzerAccept(){
 void buzzerAlert (int time){
   for ( int i=0;i<time;i++){
     // plays the buzzer the required times.
-    tone(buzzer,900);
+    tone(buzzer,1800);
     delay(150);
     tone(buzzer,1800);
     delay(150);
@@ -123,19 +129,19 @@ void relayControl_light(boolean value){
 void RFIDAccepted(String accessedby){
   writetoLCD("Accessed by: ",accessedby);
   buzzerAccept();
-  relayControl_Access(true);
-  servo1.attach(servopin);
+  // relayControl_Access(true);
+  // servo1.attach(servopin);
   servo1.write(90);
-  delay(6000);
+  delay(3000);
   servo1.write(0);
-  relayControl_Access(false);
+  // relayControl_Access(false);
   
 }
 
 void RFIDDenied(){
   writetoLCD("Access Denied","Try Again");
   buzzerAlert(5);
-  relayControl_Access(false);
+  // relayControl_Access(false);
   servo1.write(0);
  
 
@@ -143,14 +149,25 @@ void RFIDDenied(){
 
 void readDHT(float dhtData[]){
 
-  float humidOne = dht1.readHumidity();
-  float humidTwo = dht2.readHumidity();
+  float humidOne = dht1.getHumidity();
+  float humidTwo = dht2.getHumidity();
+  float tempOne  = dht1.getTemperature();
+  float tempTwo  = dht2.getTemperature();
 
-  float tempOne = dht1.readTemperature();
-  float tempTwo = dht2.readTemperature();
 
-  float ftempOne = dht1.readTemperature(true);
-  float ftempTwo = dht2.readTemperature(true);
+
+  if (isnan(humidOne) || isnan(tempOne)) {
+    Serial.println("DHT1 read failed");
+    humidOne = 0; tempOne = 0;
+  }
+  if (isnan(humidTwo) || isnan(tempTwo)) {
+    Serial.println("DHT2 read failed");  // ← This tells you which one fails
+    humidTwo = 0; tempTwo = 0;
+  }
+
+  // This library doesn't support Fahrenheit directly; convert manually
+  float ftempOne = tempOne * 9.0 / 5.0 + 32.0;
+  float ftempTwo = tempTwo * 9.0 / 5.0 + 32.0;
 
   dhtData[0] = humidOne;
   dhtData[1] = humidTwo;
@@ -158,12 +175,6 @@ void readDHT(float dhtData[]){
   dhtData[3] = tempTwo;
   dhtData[4] = ftempOne;
   dhtData[5] = ftempTwo;
-
-  if (isnan(humidOne) || isnan(humidTwo) || isnan(tempOne) || isnan(tempTwo) || isnan(ftempOne) || isnan(ftempTwo)) {
-    Serial.println("DHT read failed");
-    return;
-}
-  // dhtData[] = {humidOne,humidTwo,tempOne,tempTwo,ftempOne,ftempTwo};
 
 }
 
@@ -183,7 +194,11 @@ void gasMonitor(int reading){
 }
 
 void loop() {
-  Serial.println("New Porcess");
+  // Relay test
+  // delay(2000);
+  // digitalWrite(relay1, HIGH);
+  // delay(2000);
+  // digitalWrite(relay1, LOW);
 
   float reading[6];
   if (millis() - lastSensorRead >= sensorInterval ){
@@ -195,21 +210,30 @@ void loop() {
     writetoLCD(output1, output2);
   }
 
-  // int gasReading = digitalRead(gasPin);
-  // Serial.println("Gas Value: "+ String(gasReading));
+  int gasReading = analogRead(gasPin);
+
+  String gasvalue = String(gasReading);
+  Serial.println("Gas Value" + gasvalue);
+  delay(2000);
+  if ( gasReading >= 400){
+    gasMonitor(gasReading);
+    // delay(2000);
+  }
+  // writetoLCD(gasValue,"Hello");
+  // delay(10000);
   //  if (gasReading > gasThreshold1){
   //     // gasMonitor(gasReading);
   //     writetoLCD("Gas reading",String(gasReading));
   // }
 
-  int pirRead = digitalRead(pirPIN);
-  if (pirRead == HIGH){
-    Serial.println("Motion Yes");
-    relayControl_light(true);
-  }
-  else{
-    relayControl_light(false);
-  }
+  // int pirRead = digitalRead(pirPIN);
+  // if (pirRead == HIGH){
+  //   // Serial.println("Motion Yes");
+  //   relayControl_light(true);
+  // }
+  // else{
+  //   relayControl_light(false);
+  // }
   if (!rfid.PICC_IsNewCardPresent()) {
     return;
   }
