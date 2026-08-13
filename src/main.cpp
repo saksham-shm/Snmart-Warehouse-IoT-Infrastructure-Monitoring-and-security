@@ -13,6 +13,7 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 #define dhtOne  33
 #define dhtTwo  25
 #define pirPIN  32
+#define ledPIN  26   // NOTE: GPIO35 cannot be used here — it's input-only on ESP32
 
 MFRC522 rfid(ssPin, rstPin);
 DHT22 dht1(dhtOne);
@@ -25,8 +26,6 @@ const int buzzer   = 12;
 const int servopin = 13;
 const int gasPin   = 34;
 
-// Push button pin for silencing smoke alarm
-const int buttonPin = 26;
 
 // Gas thresholds
 const int gasThreshold1 = 600;
@@ -50,15 +49,19 @@ const unsigned long sensorInterval = 2000;
 unsigned long lastGasRead       = 0;
 const unsigned long gasInterval = 2000;
 
-// ── Non-blocking smoke buzzer state ─────────────────────────────────────────
-bool     smokeAlarmActive    = false;
-bool     buzzerToneOn        = false;
-unsigned long lastBuzzerToggle = 0;
-const unsigned long buzzerOnTime  = 300;   // ms tone ON
-const unsigned long buzzerOffTime = 200;   // ms tone OFF
+// ── 20-second alert buzzer state (non-blocking, alternates 1800/900 Hz) ──────
+bool          alertBuzzerActive  = false;
+unsigned long alertBuzzerStart   = 0;          // when the 20s window began
+bool          alertToneOn        = false;       // is tone currently playing?
+unsigned long alertLastToggle    = 0;           // last tone/silence flip
+bool          alertToneHigh      = true;        // which frequency is next
+const unsigned long ALERT_DURATION  = 20000;   // total buzzer time: 20 s
+const unsigned long ALERT_TONE_ON   =    150;  // ms tone ON per beep
+const unsigned long ALERT_TONE_OFF  =    150;  // ms silence between beeps
 
-// ── Button edge detection ────────────────────────────────────────────────────
-int buttonLastState = LOW;
+// ── Alert edge detection (fire buzzer only on NEW alert, not every read) ─────
+bool prevSmokeAlert = false;
+bool prevEnvAlert   = false;
 
 // ── Averaged sensor values (global so loop can use them) ─────────────────────
 float avgTemp        = 0;
@@ -68,6 +71,30 @@ int   lastGasReading = 0;   // persists between 2-second gas reads for LCD
 // ── Alert state flags (set by sensor reads, consumed by updateLCD) ───────────
 bool smokeAlert = false;   // true when gas >= gasThreshold1
 bool envAlert   = false;   // true when temp or humidity out of range
+
+// ── Non-blocking "door open" timer (replaces delay(3000) in RFIDAccepted) ────
+bool          doorOpen      = false;
+unsigned long doorOpenStart = 0;
+const unsigned long DOOR_OPEN_DURATION = 3000;  // how long servo stays at 90°
+
+// ── Non-blocking motion LED timer ─────────────────────────────────────────────
+//    While motionLedOn is true, the PIR is NOT re-checked (LED window is
+//    running). Once the 5 s window ends, motionLedOn goes false and the PIR
+//    is polled every loop() again until it triggers HIGH.
+bool          motionLedOn      = false;
+unsigned long motionLedStart   = 0;
+const unsigned long MOTION_LED_DURATION = 5000;  // LED stays on 5 s per trigger
+
+// ── LCD alert-display hold timers (independent of each other, non-blocking) ──
+//    Each alert message must stay on the LCD for the SAME 20 s that the
+//    buzzer plays, even if the underlying sensor value returns to normal
+//    sooner. Env and smoke alerts are tracked separately so neither one
+//    cuts the other's display time short.
+bool          envAlertDisplayActive   = false;
+unsigned long envAlertDisplayStart    = 0;
+bool          smokeAlertDisplayActive = false;
+unsigned long smokeAlertDisplayStart  = 0;
+const unsigned long ALERT_DISPLAY_DURATION = 20000;  // matches ALERT_DURATION
 
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -80,9 +107,9 @@ void setup() {
   lcd.init();
   lcd.backlight();
   lcd.setCursor(0, 0);
-  lcd.print("hello");
+  lcd.print("Systm Initiation");
   lcd.setCursor(0, 1);
-  lcd.print("Begin");
+  lcd.print("Please Wait !");
 
   pinMode(relay1, OUTPUT);
   pinMode(relay2, OUTPUT);
@@ -90,13 +117,17 @@ void setup() {
   digitalWrite(relay2, LOW);
 
   pinMode(buzzer, OUTPUT);
-  pinMode(buttonPin, INPUT_PULLDOWN);   // uses ESP32 internal pull-down
 
   servo1.attach(servopin);
-  servo1.write(0);
+  servo1.write(90);
 
   pinMode(gasPin, INPUT);
   pinMode(pirPIN, INPUT);
+  pinMode(ledPIN, OUTPUT);
+  digitalWrite(ledPIN, LOW);
+  Serial.println("PIR warming up...");
+  delay(30000);   // let PIR sensor stabilize
+  Serial.println("PIR ready");
 
   Serial.println("MFRC522 Ready");
 }
@@ -112,13 +143,12 @@ void writetoLCD(String line1, String line2) {
 }
 
 
-// ── Buzzer helpers (blocking — only used for RFID feedback) ──────────────────
+// ── Buzzer helpers (blocking — only used for RFID feedback, very short) ──────
 void buzzerAccept() {
   for (int i = 0; i < 2; i++) {
     tone(buzzer, 1800); delay(100);
     noTone(buzzer);     delay(100);
   }
-  delay(500);
 }
 
 void buzzerAlert(int times) {
@@ -140,18 +170,79 @@ void relayControl_light(boolean value) {
 
 
 // ── RFID handlers ─────────────────────────────────────────────────────────────
+//    NOTE: no delay(3000) here anymore — door timing is handled non-blocking
+//    by doorOpenRun(), called every loop() iteration.
 void RFIDAccepted(String accessedby) {
   writetoLCD("Accessed by:", accessedby);
   buzzerAccept();
-  servo1.write(90);
-  delay(3000);
   servo1.write(0);
+  doorOpen      = true;
+  doorOpenStart = millis();
 }
 
 void RFIDDenied() {
   writetoLCD("Access Denied", "Try Again");
   buzzerAlert(5);
-  servo1.write(0);
+  servo1.write(90);
+}
+
+// ── Door timer tick: call every loop iteration, no delay() ───────────────────
+//    Closes the servo automatically DOOR_OPEN_DURATION ms after RFIDAccepted().
+void doorOpenRun() {
+  if (!doorOpen) return;
+
+  if (millis() - doorOpenStart >= DOOR_OPEN_DURATION) {
+    servo1.write(90);
+    doorOpen = false;
+  }
+}
+
+
+// ── Motion LED tick: call every loop iteration, no delay() ───────────────────
+//    - If the LED is currently off: poll the PIR every call. The instant it
+//      reads HIGH, turn the LED on and start a 5 s window.
+//    - If the LED is currently on: ignore the PIR and just wait for the 5 s
+//      window to elapse, then turn the LED off (which re-enables polling on
+//      the very next loop() call — i.e. continuous checking resumes).
+void motionLedRun() {
+  if (!motionLedOn) {
+    if (digitalRead(pirPIN) == HIGH) {
+      Serial.println("Motion detected");
+      digitalWrite(ledPIN, HIGH);
+      motionLedOn    = true;
+      motionLedStart = millis();
+    }
+  } else {
+    if (millis() - motionLedStart >= MOTION_LED_DURATION) {
+      digitalWrite(ledPIN, LOW);
+      motionLedOn = false;
+    }
+  }
+}
+
+
+// ── Env alert display tick: call every loop iteration, no delay() ────────────
+//    Keeps the temp/humidity alert on the LCD for the full 20 s buzzer
+//    window, independent of whether the reading itself has recovered.
+void envAlertDisplayRun() {
+  if (!envAlertDisplayActive) return;
+
+  if (millis() - envAlertDisplayStart >= ALERT_DISPLAY_DURATION) {
+    envAlertDisplayActive = false;
+    updateLCD();   // refresh immediately instead of waiting for next sensor read
+  }
+}
+
+// ── Smoke alert display tick: call every loop iteration, no delay() ──────────
+//    Keeps the smoke alert on the LCD for the full 20 s buzzer window,
+//    independent of whether the reading itself has recovered.
+void smokeAlertDisplayRun() {
+  if (!smokeAlertDisplayActive) return;
+
+  if (millis() - smokeAlertDisplayStart >= ALERT_DISPLAY_DURATION) {
+    smokeAlertDisplayActive = false;
+    updateLCD();   // refresh immediately instead of waiting for next sensor read
+  }
 }
 
 
@@ -207,7 +298,9 @@ void writeLine1(String msg) {
 //  Buzzer controls are NOT touched here.
 void updateLCD() {
   // ── Line 0: env alert overrides normal temp/humid display ────────────────
-  if (envAlert) {
+  //    Driven by envAlertDisplayActive (20 s hold), not the live envAlert
+  //    flag, so the message stays up for the full buzzer duration.
+  if (envAlertDisplayActive) {
     bool tempOK  = (avgTemp  >= TEMP_MIN && avgTemp  <= TEMP_MAX);
     bool humidOK = (avgHumid >= HUM_MIN  && avgHumid <= HUM_MAX);
 
@@ -224,7 +317,9 @@ void updateLCD() {
   }
 
   // ── Line 1: smoke alert overrides normal smoke value display ─────────────
-  if (smokeAlert) {
+  //    Driven by smokeAlertDisplayActive (20 s hold), not the live
+  //    smokeAlert flag, so the message stays up for the full buzzer duration.
+  if (smokeAlertDisplayActive) {
     if (lastGasReading > gasThreshold2) {
       writeLine1("!SMOKE DANGER " + String(lastGasReading) + "!");
     } else {
@@ -236,29 +331,50 @@ void updateLCD() {
 }
 
 
-// ── 3. Non-blocking smoke alarm buzzer ──────────────────────────────────────
-//    Call every loop iteration. Uses millis() — NO delay().
-//    smokeAlarmActive must be set true before calling (done in loop).
-//    Push button (edge: LOW→HIGH) silences the alarm.
-void smokeAlertBuzzer() {
-  if (!smokeAlarmActive) {
-    noTone(buzzer);
-    return;
-  }
+// ── Alert buzzer: arm for a fresh 20-second run ──────────────────────────────
+//    Call once when a new alert is detected. Restarts the window even if
+//    already running (second alert while first is playing → resets to 20 s).
+void triggerAlertBuzzer() {
+  alertBuzzerActive = true;
+  alertBuzzerStart  = millis();
+  alertToneHigh     = true;
+  alertToneOn       = false;
+  alertLastToggle   = millis();
+  Serial.println("Alert buzzer armed: 20 s");
+}
+
+// ── Alert buzzer tick: call every loop iteration, no delay() ─────────────────
+//    Alternates tone(1800) / tone(900) every ALERT_TONE_ON ms,
+//    with ALERT_TONE_OFF ms silence between beeps.
+//    Stops itself after ALERT_DURATION ms.
+void alertBuzzerRun() {
+  if (!alertBuzzerActive) return;
 
   unsigned long now = millis();
 
-  if (buzzerToneOn) {
-    if (now - lastBuzzerToggle >= buzzerOnTime) {
+  // Auto-stop after 20 seconds
+  if (now - alertBuzzerStart >= ALERT_DURATION) {
+    alertBuzzerActive = false;
+    noTone(buzzer);
+    Serial.println("Alert buzzer finished 20 s");
+    return;
+  }
+
+  if (alertToneOn) {
+    // Currently playing — check if it's time to go silent
+    if (now - alertLastToggle >= ALERT_TONE_ON) {
       noTone(buzzer);
-      buzzerToneOn      = false;
-      lastBuzzerToggle  = now;
+      alertToneOn     = false;
+      alertLastToggle = now;
     }
   } else {
-    if (now - lastBuzzerToggle >= buzzerOffTime) {
-      tone(buzzer, 1800);
-      buzzerToneOn      = true;
-      lastBuzzerToggle  = now;
+    // Currently silent — check if it's time to play the next tone
+    if (now - alertLastToggle >= ALERT_TONE_OFF) {
+      int freq = alertToneHigh ? 1800 : 900;
+      tone(buzzer, freq);
+      alertToneHigh   = !alertToneHigh;   // alternate for next beep
+      alertToneOn     = true;
+      alertLastToggle = now;
     }
   }
 }
@@ -268,24 +384,20 @@ void smokeAlertBuzzer() {
 // ────────────────────────────────────────────────────────────────────────────
 void loop() {
 
-  // ── A. Push-button edge detection (silences smoke alarm) ─────────────────
-  int buttonState = digitalRead(buttonPin);
-  if (buttonState == HIGH && buttonLastState == LOW) {
-    // Rising edge detected — silence the alarm
-    if (smokeAlarmActive) {
-      smokeAlarmActive = false;
-      noTone(buzzer);
-      Serial.println("Smoke alarm silenced by button");
-      writetoLCD("Alarm silenced", "by operator");
-      delay(1500);   // Brief acknowledgement display
-    }
-  }
-  buttonLastState = buttonState;
+  // ── A. Alert buzzer tick (runs every iteration, no delay) ────────────────
+  alertBuzzerRun();
 
-  // ── B. Non-blocking smoke buzzer (runs every iteration) ──────────────────
-  smokeAlertBuzzer();
+  // ── A2. Door-open timer tick (runs every iteration, no delay) ────────────
+  doorOpenRun();
 
-  // ── C. DHT sensor read (every sensorInterval ms) ─────────────────────────
+  // ── A3. Motion LED tick (runs every iteration, no delay) ─────────────────
+  motionLedRun();
+
+  // ── A4. LCD alert-display hold ticks (runs every iteration, no delay) ────
+  envAlertDisplayRun();
+  smokeAlertDisplayRun();
+
+  // ── B. DHT sensor read (every sensorInterval ms) ─────────────────────────
   float reading[3];   // [0]=avgHumid  [1]=avgTempC  [2]=avgTempF
   if (millis() - lastSensorRead >= sensorInterval) {
     lastSensorRead = millis();
@@ -294,34 +406,43 @@ void loop() {
     avgTemp  = reading[1];
     avgHumid = reading[0];
 
-    // Set flag — clears itself automatically when readings return to safe range
     bool tempOK  = (avgTemp  >= TEMP_MIN && avgTemp  <= TEMP_MAX);
     bool humidOK = (avgHumid >= HUM_MIN  && avgHumid <= HUM_MAX);
     envAlert = (!tempOK || !humidOK);
 
-    if (envAlert) Serial.println("ALERT: Env out of range T=" + String(avgTemp) + " H=" + String(avgHumid));
+    // Fire buzzer only on the rising edge (condition just became true)
+    if (envAlert && !prevEnvAlert) {
+      Serial.println("ALERT: Env out of range T=" + String(avgTemp) + " H=" + String(avgHumid));
+      triggerAlertBuzzer();
+      envAlertDisplayActive = true;
+      envAlertDisplayStart  = millis();
+    }
+    prevEnvAlert = envAlert;
 
     updateLCD();
   }
 
-  // ── D. Gas / smoke sensor (sampled every gasInterval ms) ────────────────
+  // ── C. Gas / smoke sensor (sampled every gasInterval ms) ─────────────────
   if (millis() - lastGasRead >= gasInterval) {
     lastGasRead    = millis();
     lastGasReading = analogRead(gasPin);
     Serial.println("Gas Value: " + String(lastGasReading));
 
-    // Set flag — clears itself when reading drops back below threshold
     smokeAlert = (lastGasReading >= gasThreshold1);
 
-    if (smokeAlert) {
-      smokeAlarmActive = true;       // Arm the non-blocking buzzer (unchanged)
+    // Fire buzzer only on the rising edge (condition just became true)
+    if (smokeAlert && !prevSmokeAlert) {
       Serial.println("ALERT: Smoke detected: " + String(lastGasReading));
+      triggerAlertBuzzer();
+      smokeAlertDisplayActive = true;
+      smokeAlertDisplayStart  = millis();
     }
+    prevSmokeAlert = smokeAlert;
 
     updateLCD();
   }
 
-  // ── E. RFID scan ─────────────────────────────────────────────────────────
+  // ── D. RFID scan ─────────────────────────────────────────────────────────
   if (!rfid.PICC_IsNewCardPresent()) return;
   if (!rfid.PICC_ReadCardSerial())   return;
 
@@ -351,4 +472,5 @@ void loop() {
 
   Serial.println("End of line");
   rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();   // ← FIX: release crypto session so next card reliably detected
 }
