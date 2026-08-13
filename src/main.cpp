@@ -29,7 +29,7 @@ const int gasPin   = 34;
 const int buttonPin = 26;
 
 // Gas thresholds
-const int gasThreshold1 = 400;
+const int gasThreshold1 = 600;
 const int gasThreshold2 = 800;
 
 // Temperature and humidity safe ranges
@@ -47,6 +47,9 @@ String employeeName[]  = {"Employee 1",  "Employee 2",  "Employee 3"};
 unsigned long lastSensorRead    = 0;
 const unsigned long sensorInterval = 2000;
 
+unsigned long lastGasRead       = 0;
+const unsigned long gasInterval = 2000;
+
 // ── Non-blocking smoke buzzer state ─────────────────────────────────────────
 bool     smokeAlarmActive    = false;
 bool     buzzerToneOn        = false;
@@ -58,8 +61,13 @@ const unsigned long buzzerOffTime = 200;   // ms tone OFF
 int buttonLastState = LOW;
 
 // ── Averaged sensor values (global so loop can use them) ─────────────────────
-float avgTemp  = 0;
-float avgHumid = 0;
+float avgTemp        = 0;
+float avgHumid       = 0;
+int   lastGasReading = 0;   // persists between 2-second gas reads for LCD
+
+// ── Alert state flags (set by sensor reads, consumed by updateLCD) ───────────
+bool smokeAlert = false;   // true when gas >= gasThreshold1
+bool envAlert   = false;   // true when temp or humidity out of range
 
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -174,25 +182,57 @@ void readDHT(float dhtData[]) {
 }
 
 
-// ── 2. Check if averaged temp/humidity are in the safe range ─────────────────
-//    Call AFTER readDHT(). Displays alert on LCD when out of range.
-void checkConditions(float temp, float humid) {
-  bool tempOK  = (temp  >= TEMP_MIN  && temp  <= TEMP_MAX);
-  bool humidOK = (humid >= HUM_MIN   && humid <= HUM_MAX);
+// ── Line helpers (pad to 16 chars so no stale characters remain) ─────────────
+void writeLine0(String msg) {
+  lcd.setCursor(0, 0);
+  lcd.print(msg);
+  for (int i = msg.length(); i < 16; i++) lcd.print(" ");
+}
 
-  if (!tempOK && !humidOK) {
-    writetoLCD("ALERT: Temp+Hum", "Out of Range!");
-    Serial.println("ALERT: Both temp and humidity out of range");
-  } else if (!tempOK) {
-    String msg = "T:" + String(temp, 1) + " OOR";
-    writetoLCD("ALERT: Temp", msg);
-    Serial.println("ALERT: Temperature out of range: " + String(temp));
-  } else if (!humidOK) {
-    String msg = "H:" + String(humid, 1) + "% OOR";
-    writetoLCD("ALERT: Humidity", msg);
-    Serial.println("ALERT: Humidity out of range: " + String(humid));
+void writeLine1(String msg) {
+  lcd.setCursor(0, 1);
+  lcd.print(msg);
+  for (int i = msg.length(); i < 16; i++) lcd.print(" ");
+}
+
+// ── Unified LCD update — called after every sensor read ──────────────────────
+//
+//  Four cases based on smokeAlert / envAlert flags:
+//
+//  smokeAlert=F  envAlert=F  → L0: temp+humid normal   L1: smoke value OK
+//  smokeAlert=T  envAlert=F  → L0: temp+humid normal   L1: !SMOKE ALERT!
+//  smokeAlert=F  envAlert=T  → L0: !TEMP/HUM ALERT!    L1: smoke value OK
+//  smokeAlert=T  envAlert=T  → L0: !TEMP/HUM ALERT!    L1: !SMOKE ALERT!
+//
+//  Buzzer controls are NOT touched here.
+void updateLCD() {
+  // ── Line 0: env alert overrides normal temp/humid display ────────────────
+  if (envAlert) {
+    bool tempOK  = (avgTemp  >= TEMP_MIN && avgTemp  <= TEMP_MAX);
+    bool humidOK = (avgHumid >= HUM_MIN  && avgHumid <= HUM_MAX);
+
+    if (!tempOK && !humidOK) {
+      writeLine0("!T+H OUT RANGE!");
+    } else if (!tempOK) {
+      writeLine0("!TEMP ALERT " + String(avgTemp, 1) + (char)223 + "!");
+    } else {
+      writeLine0("!HUM ALERT " + String(avgHumid, 1) + "%!");
+    }
+  } else {
+    // Normal: show averaged readings
+    writeLine0("H:" + String(avgHumid, 1) + "% T:" + String(avgTemp, 1) + (char)223 + "C");
   }
-  // If both OK, do nothing — normal LCD display handled in loop
+
+  // ── Line 1: smoke alert overrides normal smoke value display ─────────────
+  if (smokeAlert) {
+    if (lastGasReading > gasThreshold2) {
+      writeLine1("!SMOKE DANGER " + String(lastGasReading) + "!");
+    } else {
+      writeLine1("!SMOKE ALERT " + String(lastGasReading) + "!");
+    }
+  } else {
+    writeLine1("Smoke:" + String(lastGasReading) + " OK");
+  }
 }
 
 
@@ -224,15 +264,6 @@ void smokeAlertBuzzer() {
 }
 
 
-// ── Gas monitor (LCD warning when smoke detected) ────────────────────────────
-void gasMonitor(int reading) {
-  if (reading > gasThreshold2) {
-    writetoLCD("Gas:" + String(reading), "Highly toxic!");
-  } else if (reading > gasThreshold1) {
-    writetoLCD("Gas:" + String(reading), "Caution: Smoke");
-  }
-}
-
 
 // ────────────────────────────────────────────────────────────────────────────
 void loop() {
@@ -263,23 +294,31 @@ void loop() {
     avgTemp  = reading[1];
     avgHumid = reading[0];
 
-    // Display averaged values on ONE line (line 0); line 1 left for alerts
-    String output = "H:" + String(avgHumid, 1) + "% T:" + String(avgTemp, 1) + (char)223 + "C";
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print(output);
+    // Set flag — clears itself automatically when readings return to safe range
+    bool tempOK  = (avgTemp  >= TEMP_MIN && avgTemp  <= TEMP_MAX);
+    bool humidOK = (avgHumid >= HUM_MIN  && avgHumid <= HUM_MAX);
+    envAlert = (!tempOK || !humidOK);
 
-    // Check if conditions are out of range and alert on line 1
-    checkConditions(avgTemp, avgHumid);
+    if (envAlert) Serial.println("ALERT: Env out of range T=" + String(avgTemp) + " H=" + String(avgHumid));
+
+    updateLCD();
   }
 
-  // ── D. Gas / smoke sensor ─────────────────────────────────────────────────
-  int gasReading = analogRead(gasPin);
-  Serial.println("Gas Value: " + String(gasReading));
+  // ── D. Gas / smoke sensor (sampled every gasInterval ms) ────────────────
+  if (millis() - lastGasRead >= gasInterval) {
+    lastGasRead    = millis();
+    lastGasReading = analogRead(gasPin);
+    Serial.println("Gas Value: " + String(lastGasReading));
 
-  if (gasReading >= gasThreshold1) {
-    gasMonitor(gasReading);          // LCD warning
-    smokeAlarmActive = true;         // Arm the non-blocking buzzer
+    // Set flag — clears itself when reading drops back below threshold
+    smokeAlert = (lastGasReading >= gasThreshold1);
+
+    if (smokeAlert) {
+      smokeAlarmActive = true;       // Arm the non-blocking buzzer (unchanged)
+      Serial.println("ALERT: Smoke detected: " + String(lastGasReading));
+    }
+
+    updateLCD();
   }
 
   // ── E. RFID scan ─────────────────────────────────────────────────────────
