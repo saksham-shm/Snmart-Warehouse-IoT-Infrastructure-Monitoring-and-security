@@ -1,246 +1,290 @@
 #include <DHT22.h>
-
 #include <LiquidCrystal_I2C.h>
-#include<Wire.h>
-#include<SPI.h>
-#include<MFRC522.h>
-#include<ESP32Servo.h>
-// #include<DHT.h>
-
+#include <Wire.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <ESP32Servo.h>
 
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
 // RFID pins
-#define ssPin 5
-#define rstPin 4
-#define dhtOne 33
-#define dhtTwo 25
-#define pirPIN 32
+#define ssPin   5
+#define rstPin  4
+#define dhtOne  33
+#define dhtTwo  25
+#define pirPIN  32
 
-
-MFRC522 rfid(ssPin,rstPin);
-DHT22 dht1(dhtOne);   
+MFRC522 rfid(ssPin, rstPin);
+DHT22 dht1(dhtOne);
 DHT22 dht2(dhtTwo);
 
-// Relay Pins, Buzzer pins, ServoPins
-const int relay1 = 27;   
-const int relay2 = 14;
-const int buzzer=12;
-const int servopin=13;
-const int gasPin=34;
-const int gasThreshold1=400;
-const int gasThreshold2=800;
+// Relay, Buzzer, Servo pins
+const int relay1   = 27;
+const int relay2   = 14;
+const int buzzer   = 12;
+const int servopin = 13;
+const int gasPin   = 34;
+
+// Push button pin for silencing smoke alarm
+const int buttonPin = 26;
+
+// Gas thresholds
+const int gasThreshold1 = 400;
+const int gasThreshold2 = 800;
+
+// Temperature and humidity safe ranges
+const float TEMP_MIN  = -10.0;
+const float TEMP_MAX  =  30.0;
+const float HUM_MIN   =  60.0;
+const float HUM_MAX   =  90.0;
+
 Servo servo1;
 
-//  08 2F BF 33
-String cardsAccepted[] = {"83 AC CD 27","01 AC 03 04","55 66 77 88"};
-String employeeName[] = {"Employee 1","Employee 2","Employee 3"};
+String cardsAccepted[] = {"83 AC CD 27", "01 AC 03 04", "55 66 77 88"};
+String employeeName[]  = {"Employee 1",  "Employee 2",  "Employee 3"};
 
-unsigned long lastSensorRead = 0;
+// ── Timing ──────────────────────────────────────────────────────────────────
+unsigned long lastSensorRead    = 0;
 const unsigned long sensorInterval = 2000;
 
+// ── Non-blocking smoke buzzer state ─────────────────────────────────────────
+bool     smokeAlarmActive    = false;
+bool     buzzerToneOn        = false;
+unsigned long lastBuzzerToggle = 0;
+const unsigned long buzzerOnTime  = 300;   // ms tone ON
+const unsigned long buzzerOffTime = 200;   // ms tone OFF
+
+// ── Button edge detection ────────────────────────────────────────────────────
+int buttonLastState = LOW;
+
+// ── Averaged sensor values (global so loop can use them) ─────────────────────
+float avgTemp  = 0;
+float avgHumid = 0;
 
 
+// ────────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(9600);
   SPI.begin();
   rfid.PCD_Init();
-    // SDA = Serial Data -> 23 SCL = Serial Clock ->22
-  //Initialize the lcd
-  Wire.begin(21,22);  // LCD Screen 1    
+
+  Wire.begin(21, 22);
   lcd.init();
   lcd.backlight();
-
-  lcd.setCursor(0,0);
+  lcd.setCursor(0, 0);
   lcd.print("hello");
-  lcd.setCursor(0,1);
+  lcd.setCursor(0, 1);
   lcd.print("Begin");
-  // Relay
+
   pinMode(relay1, OUTPUT);
-  pinMode(relay2,OUTPUT);
-  digitalWrite(relay1, LOW);   // ← add this
-  digitalWrite(relay2, LOW);  
-  // digitalWrite(relay1,LOW);
-  // Buzzer
-  pinMode(buzzer,OUTPUT);
-  // RFID
+  pinMode(relay2, OUTPUT);
+  digitalWrite(relay1, LOW);
+  digitalWrite(relay2, LOW);
+
+  pinMode(buzzer, OUTPUT);
+  pinMode(buttonPin, INPUT_PULLDOWN);   // uses ESP32 internal pull-down
 
   servo1.attach(servopin);
   servo1.write(0);
 
   pinMode(gasPin, INPUT);
-  Serial.println("MFRC522 Ready");
-
   pinMode(pirPIN, INPUT);
+
+  Serial.println("MFRC522 Ready");
 }
 
-// Function to write into lcd Screen with no return value
-void writetoLCD(String line1, String line2){
+
+// ── LCD helper ───────────────────────────────────────────────────────────────
+void writetoLCD(String line1, String line2) {
   lcd.clear();
-// Write new information
-  lcd.setCursor(0,0);
+  lcd.setCursor(0, 0);
   lcd.print(line1);
-  lcd.setCursor(0,1);
+  lcd.setCursor(0, 1);
   lcd.print(line2);
 }
 
-void buzzerAccept(){
-  for (int i=0;i<2;i++){
-    tone(buzzer, 1800);
-    delay(100);
-    noTone(buzzer);
-    delay(100);
+
+// ── Buzzer helpers (blocking — only used for RFID feedback) ──────────────────
+void buzzerAccept() {
+  for (int i = 0; i < 2; i++) {
+    tone(buzzer, 1800); delay(100);
+    noTone(buzzer);     delay(100);
   }
   delay(500);
 }
 
-void buzzerAlert (int time){
-  for ( int i=0;i<time;i++){
-    // plays the buzzer the required times.
-    tone(buzzer,1800);
-    delay(150);
-    tone(buzzer,1800);
-    delay(150);
-    noTone(buzzer);
-    delay(150);
+void buzzerAlert(int times) {
+  for (int i = 0; i < times; i++) {
+    tone(buzzer, 1800); delay(150);
+    noTone(buzzer);     delay(150);
   }
 }
 
-void relayControl_Access(boolean value){
-  if (value == true){
-    digitalWrite(relay1, HIGH);
-   }
-  else{
-    digitalWrite(relay1, LOW);
-  }
+
+// ── Relay helpers ────────────────────────────────────────────────────────────
+void relayControl_Access(boolean value) {
+  digitalWrite(relay1, value ? HIGH : LOW);
 }
 
-void relayControl_light(boolean value){
-  if (value){
-    digitalWrite(relay2, HIGH);
-  }
-  else{
-    digitalWrite(relay2, LOW);
-  }
-
+void relayControl_light(boolean value) {
+  digitalWrite(relay2, value ? HIGH : LOW);
 }
 
 
-void RFIDAccepted(String accessedby){
-  writetoLCD("Accessed by: ",accessedby);
+// ── RFID handlers ─────────────────────────────────────────────────────────────
+void RFIDAccepted(String accessedby) {
+  writetoLCD("Accessed by:", accessedby);
   buzzerAccept();
-  // relayControl_Access(true);
-  // servo1.attach(servopin);
   servo1.write(90);
   delay(3000);
   servo1.write(0);
-  // relayControl_Access(false);
-  
 }
 
-void RFIDDenied(){
-  writetoLCD("Access Denied","Try Again");
+void RFIDDenied() {
+  writetoLCD("Access Denied", "Try Again");
   buzzerAlert(5);
-  // relayControl_Access(false);
   servo1.write(0);
- 
-
 }
 
-void readDHT(float dhtData[]){
 
+// ── 1. Read both DHTs and store AVERAGES in dhtData[] ────────────────────────
+//    dhtData[0] = avgHumidity   dhtData[1] = avgTempC   dhtData[2] = avgTempF
+void readDHT(float dhtData[]) {
   float humidOne = dht1.getHumidity();
   float humidTwo = dht2.getHumidity();
   float tempOne  = dht1.getTemperature();
   float tempTwo  = dht2.getTemperature();
-
-
 
   if (isnan(humidOne) || isnan(tempOne)) {
     Serial.println("DHT1 read failed");
     humidOne = 0; tempOne = 0;
   }
   if (isnan(humidTwo) || isnan(tempTwo)) {
-    Serial.println("DHT2 read failed");  // ← This tells you which one fails
+    Serial.println("DHT2 read failed");
     humidTwo = 0; tempTwo = 0;
   }
 
-  // This library doesn't support Fahrenheit directly; convert manually
-  float ftempOne = tempOne * 9.0 / 5.0 + 32.0;
-  float ftempTwo = tempTwo * 9.0 / 5.0 + 32.0;
+  float avgH = (humidOne + humidTwo) / 2.0;
+  float avgT = (tempOne  + tempTwo)  / 2.0;
+  float avgF = avgT * 9.0 / 5.0 + 32.0;
 
-  dhtData[0] = humidOne;
-  dhtData[1] = humidTwo;
-  dhtData[2] = tempOne;
-  dhtData[3] = tempTwo;
-  dhtData[4] = ftempOne;
-  dhtData[5] = ftempTwo;
-
+  dhtData[0] = avgH;
+  dhtData[1] = avgT;
+  dhtData[2] = avgF;
 }
 
-void gasMonitor(int reading){
 
-  if(reading > gasThreshold2){
-    writetoLCD("Gas Reading:"+ String(reading),"Highly toxic");
-    delay(500);
+// ── 2. Check if averaged temp/humidity are in the safe range ─────────────────
+//    Call AFTER readDHT(). Displays alert on LCD when out of range.
+void checkConditions(float temp, float humid) {
+  bool tempOK  = (temp  >= TEMP_MIN  && temp  <= TEMP_MAX);
+  bool humidOK = (humid >= HUM_MIN   && humid <= HUM_MAX);
+
+  if (!tempOK && !humidOK) {
+    writetoLCD("ALERT: Temp+Hum", "Out of Range!");
+    Serial.println("ALERT: Both temp and humidity out of range");
+  } else if (!tempOK) {
+    String msg = "T:" + String(temp, 1) + " OOR";
+    writetoLCD("ALERT: Temp", msg);
+    Serial.println("ALERT: Temperature out of range: " + String(temp));
+  } else if (!humidOK) {
+    String msg = "H:" + String(humid, 1) + "% OOR";
+    writetoLCD("ALERT: Humidity", msg);
+    Serial.println("ALERT: Humidity out of range: " + String(humid));
   }
-  else if (reading > gasThreshold1){
-    writetoLCD("Gas Reading:"+String(reading),"Toxis gas");
-    delay(500);
-  }
-  else{
+  // If both OK, do nothing — normal LCD display handled in loop
+}
+
+
+// ── 3. Non-blocking smoke alarm buzzer ──────────────────────────────────────
+//    Call every loop iteration. Uses millis() — NO delay().
+//    smokeAlarmActive must be set true before calling (done in loop).
+//    Push button (edge: LOW→HIGH) silences the alarm.
+void smokeAlertBuzzer() {
+  if (!smokeAlarmActive) {
+    noTone(buzzer);
     return;
   }
+
+  unsigned long now = millis();
+
+  if (buzzerToneOn) {
+    if (now - lastBuzzerToggle >= buzzerOnTime) {
+      noTone(buzzer);
+      buzzerToneOn      = false;
+      lastBuzzerToggle  = now;
+    }
+  } else {
+    if (now - lastBuzzerToggle >= buzzerOffTime) {
+      tone(buzzer, 1800);
+      buzzerToneOn      = true;
+      lastBuzzerToggle  = now;
+    }
+  }
 }
 
+
+// ── Gas monitor (LCD warning when smoke detected) ────────────────────────────
+void gasMonitor(int reading) {
+  if (reading > gasThreshold2) {
+    writetoLCD("Gas:" + String(reading), "Highly toxic!");
+  } else if (reading > gasThreshold1) {
+    writetoLCD("Gas:" + String(reading), "Caution: Smoke");
+  }
+}
+
+
+// ────────────────────────────────────────────────────────────────────────────
 void loop() {
-  // Relay test
-  // delay(2000);
-  // digitalWrite(relay1, HIGH);
-  // delay(2000);
-  // digitalWrite(relay1, LOW);
 
-  float reading[6];
-  if (millis() - lastSensorRead >= sensorInterval ){
+  // ── A. Push-button edge detection (silences smoke alarm) ─────────────────
+  int buttonState = digitalRead(buttonPin);
+  if (buttonState == HIGH && buttonLastState == LOW) {
+    // Rising edge detected — silence the alarm
+    if (smokeAlarmActive) {
+      smokeAlarmActive = false;
+      noTone(buzzer);
+      Serial.println("Smoke alarm silenced by button");
+      writetoLCD("Alarm silenced", "by operator");
+      delay(1500);   // Brief acknowledgement display
+    }
+  }
+  buttonLastState = buttonState;
 
+  // ── B. Non-blocking smoke buzzer (runs every iteration) ──────────────────
+  smokeAlertBuzzer();
+
+  // ── C. DHT sensor read (every sensorInterval ms) ─────────────────────────
+  float reading[3];   // [0]=avgHumid  [1]=avgTempC  [2]=avgTempF
+  if (millis() - lastSensorRead >= sensorInterval) {
     lastSensorRead = millis();
     readDHT(reading);
-    String output1 = "H1:" + String(reading[0],1) + "%" +"T1:"+String(reading[2],1)+"°C" ;
-    String output2 = "H2:" + String(reading[1],1) + "%"+"T2:"+String(reading[3],1)+"°C";
-    writetoLCD(output1, output2);
+
+    avgTemp  = reading[1];
+    avgHumid = reading[0];
+
+    // Display averaged values on ONE line (line 0); line 1 left for alerts
+    String output = "H:" + String(avgHumid, 1) + "% T:" + String(avgTemp, 1) + (char)223 + "C";
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print(output);
+
+    // Check if conditions are out of range and alert on line 1
+    checkConditions(avgTemp, avgHumid);
   }
 
+  // ── D. Gas / smoke sensor ─────────────────────────────────────────────────
   int gasReading = analogRead(gasPin);
+  Serial.println("Gas Value: " + String(gasReading));
 
-  String gasvalue = String(gasReading);
-  Serial.println("Gas Value" + gasvalue);
-  delay(2000);
-  if ( gasReading >= 400){
-    gasMonitor(gasReading);
-    // delay(2000);
-  }
-  // writetoLCD(gasValue,"Hello");
-  // delay(10000);
-  //  if (gasReading > gasThreshold1){
-  //     // gasMonitor(gasReading);
-  //     writetoLCD("Gas reading",String(gasReading));
-  // }
-
-  // int pirRead = digitalRead(pirPIN);
-  // if (pirRead == HIGH){
-  //   // Serial.println("Motion Yes");
-  //   relayControl_light(true);
-  // }
-  // else{
-  //   relayControl_light(false);
-  // }
-  if (!rfid.PICC_IsNewCardPresent()) {
-    return;
+  if (gasReading >= gasThreshold1) {
+    gasMonitor(gasReading);          // LCD warning
+    smokeAlarmActive = true;         // Arm the non-blocking buzzer
   }
 
-  if (!rfid.PICC_ReadCardSerial()) {
-    return;
-  }
+  // ── E. RFID scan ─────────────────────────────────────────────────────────
+  if (!rfid.PICC_IsNewCardPresent()) return;
+  if (!rfid.PICC_ReadCardSerial())   return;
 
   String content = "";
   for (byte i = 0; i < rfid.uid.size; i++) {
@@ -251,25 +295,21 @@ void loop() {
   String readUID = content.substring(1);
 
   Serial.print("UID: ");
-  Serial.println(readUID); 
+  Serial.println(readUID);
 
   boolean allowed = false;
   const int NumCards = sizeof(cardsAccepted) / sizeof(cardsAccepted[0]);
 
-  for (int i=0;i<NumCards;i++){
-
-    if (readUID == cardsAccepted[i]){
+  for (int i = 0; i < NumCards; i++) {
+    if (readUID == cardsAccepted[i]) {
       RFIDAccepted(employeeName[i]);
       allowed = true;
       break;
     }
   }
 
-  if (!allowed){
-    RFIDDenied();
-  }
+  if (!allowed) RFIDDenied();
 
   Serial.println("End of line");
   rfid.PICC_HaltA();
-
 }
